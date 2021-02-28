@@ -1,0 +1,12 @@
+name: sales_dashboard
+title: sales_dashboard
+username:
+account: n-rashid
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 3708361
+bundleId: 4279461
+url: https://n-rashid.shinyapps.io/sales_dashboard/
+when: 1614451163.15751
+asMultiple: FALSE
+asStatic: FALSE

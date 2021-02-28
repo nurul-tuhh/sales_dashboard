@@ -1,0 +1,320 @@
+---
+title: "Sales Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(plotly)
+library(raster)
+library(sf)
+library(lubridate)
+library(DT)
+library(shinyWidgets)
+library(rgeos)
+```
+
+<!-- Read Tables -->
+```{r echo=FALSE}
+# Bike data
+bikes_tbl      <- readRDS("bikes_tbl.rds")
+bikeshops_tbl  <- readRDS("bikeshops_tbl.rds")
+orderlines_tbl <- readRDS("orderlines_tbl.rds")
+
+bike_orderlines_tbl <- orderlines_tbl %>%
+    left_join(bikes_tbl,     by = c("product_id" = "bike_id")) %>%
+    left_join(bikeshops_tbl, by = c("customer_id" = "bikeshop_id")) %>%
+    mutate(total_price = price_euro * quantity)
+```
+<!-- Read Tables end -->
+
+<!-- Helper functions -->
+```{r echo=FALSE}
+format_to_euro <- function(x, suffix = " €") {
+    scales::dollar(
+        x,
+        suffix = suffix,
+        prefix = "",
+        big.mark = ".",
+        decimal.mark = ","
+    )
+}
+
+euro_format <- function(
+    scale = 1,
+    prefix = "",
+    suffix  = " €",
+    big.mark = ".",
+    decimal.mark = ","
+) {
+    scales::dollar_format(
+        suffix = suffix,
+        prefix = prefix,
+        big.mark = big.mark,
+        decimal.mark = decimal.mark,
+        scale = scale
+    )
+}
+```
+<!-- Helper functions end -->
+
+
+<!-- Read tables and generate data -->
+
+```{r echo=FALSE}
+
+# German spatial data
+germany_sp <- getData('GADM', country='DE', level=1) 
+# Convert SpatialPolygonsDataFrame to an sf dataframe
+germany_sf <- st_as_sf(germany_sp) %>% 
+                  # Add english names
+                  mutate(VARNAME_1 = ifelse(is.na(VARNAME_1), NAME_1, VARNAME_1))
+
+category_1_items <- bikes_tbl %>% distinct(category_1)
+category_2_items <- bikes_tbl %>% distinct(category_2)
+```
+
+<!-- Read tables and generate data end-->
+
+<!-- Page layout -->
+
+<!-- Sidebar -->
+Sidebar {.sidebar}
+=====================================
+
+```{r echo=FALSE}
+# Inputs
+dateRangeInput(inputId = "date_range", 
+               label   = h4("Date Range"), 
+               start   = "2010-01-01", 
+               end     = today(),        
+               min     = ymd("2010-01-01"), 
+               max     = today(), 
+               startview = "year")
+
+shinyWidgets::checkboxGroupButtons(inputId = "bike_type", 
+                   label   = h4("Bike Type"),
+                   choices = c(category_1_items$category_1), 
+                   selected = c("Road", "Mountain"),
+                   checkIcon = list(
+                    yes = icon("check-square"),
+                    no = icon("square-o")
+                  ))
+
+shinyWidgets::pickerInput(inputId = "bike_family", 
+                   label   = h4("Bike Family"),
+                   choices = c(category_2_items$category_2), 
+                   selected = c(category_2_items$category_2),
+                   multiple = TRUE,
+                   options = list(
+                     `action-box` = TRUE,
+                     `selected-text-format` = "count > 3"
+                   ))
+
+# Reset Button
+actionButton(inputId = "reset", 
+             label   = "Reset", 
+             icon    = icon("sync"))
+
+observeEvent(eventExpr = input$reset, handlerExpr = {
+  
+  updateCheckboxGroupButtons(session  = session, 
+                           inputId  = "bike_type", 
+                           selected = c("Road"))
+  
+  updateCheckboxGroupButtons(session  = session, 
+                         inputId  = "bike_family", 
+                         selected = c("Race"))
+  
+  updateDateRangeInput(session = session, 
+                       inputId = "date_range", 
+                       start   = "2018-01-01", 
+                       end     = today())
+})
+```
+<!-- Sidebar end -->
+
+```{r echo=FALSE}
+reactiveFilterredData <- reactive({
+  bike_orderlines_tbl %>% 
+  filter(category_1 %in% input$bike_type) %>% 
+  filter(category_2 %in% input$bike_family) %>% 
+  filter(order_date >= ymd(input$date_range[1]) & order_date <= ymd(input$date_range[2]))
+})
+```
+
+# Dashboard
+
+## Row {data-width=150}
+
+<!-- Valueboxes -->
+### Order
+```{r echo=FALSE}
+valueboxOrder <- reactive({
+  reactiveFilterredData() %>% 
+  summarise(n = n())
+})
+
+renderValueBox({
+  valueBox(
+    valueboxOrder(),
+    "Orders",
+    icon = "fa-heartbeat",
+    color = "green"
+  )
+})
+```
+
+### Sales
+```{r echo=FALSE}
+valueboxSales <- reactive({
+  reactiveFilterredData() %>% 
+  summarise(total_sales = sum(total_price)) %>% 
+    paste("EUR", sep = " ")
+})
+
+renderValueBox({
+  valueBox(
+    valueboxSales(),
+    "Sales",
+    icon = "fa-money-check-alt",
+    color = "blue"
+  )
+})
+```
+
+### Ratio, Mountain to Road
+```{r echo=FALSE}
+valueboxRatio <- reactive({
+  ratioTblValues <- reactiveFilterredData() %>%
+  modify_if(is.character, as.factor) %>% 
+  group_by(category_1) %>% 
+  tally()
+
+  mountainValue <- ratioTblValues %>% filter(category_1 == "Mountain")
+  roadValue <- ratioTblValues %>% filter(category_1 == "Road")
+  
+  (mountainValue$n / roadValue$n)
+})
+
+renderValueBox({
+  valueBox(
+    valueboxRatio(),
+    "Ratio, Mountain to Road",
+    icon = "fa-brain",
+    color = "purple"
+  )
+})
+```
+<!-- Valueboxes end -->
+
+<!-- Charts -->
+## Row
+
+### By State
+```{r echo=FALSE}
+geo_plot_tbl <- reactive({
+  reactiveFilterredData() %>% 
+    group_by(state) %>%
+    summarise(total_revenue = sum(total_price)) %>%
+    ungroup() %>%
+    right_join(germany_sf, by = c("state" = "VARNAME_1")) %>% 
+    mutate(total_revenue = ifelse(is.na(total_revenue), 0, total_revenue)) %>% 
+    mutate(label_text = str_glue("State: {state} Revenue: {format_to_euro(total_revenue)}")) %>% 
+    st_as_sf()
+})
+
+renderPlotly({
+  plot_ly(geo_plot_tbl(),
+        split      = ~NAME_1, 
+        color      = ~total_revenue,
+        colors     = "Blues",
+        stroke     = I("black"),
+        hoverinfo  = 'text', 
+        text       = ~label_text, 
+        hoveron    = "fills", 
+        showlegend = FALSE)
+})
+```
+
+### Over Time
+```{r echo=FALSE}
+radioGroupButtons(
+   inputId = "time_unit",
+   label = "Time Unit",
+   choices = c("D", "W", "M", "Q", "Y"),
+   selected = "M",
+   status = "primary",
+   justified = TRUE,
+   checkIcon = list(
+      yes = icon("ok", 
+    lib = "glyphicon"))
+)
+
+totalSalesTbl <- reactive({
+  if (input$time_unit == "D") {
+    reactiveFilterredData() %>%
+    dplyr::select(order_date, total_price) %>%
+    mutate(date_rounded = order_date) %>%
+    group_by(date_rounded) %>%
+    summarise(total_sales = sum(total_price)) %>%
+    ungroup() %>%
+    mutate(label_text = str_glue("Sales: {format_to_euro(total_sales)} Date: {date_rounded %>% format('%d %B, %Y')}"))
+  } else if (input$time_unit == "W") {
+    reactiveFilterredData() %>%
+    dplyr::select(order_date, total_price) %>%
+    mutate(date_rounded = floor_date(order_date, unit = "week")) %>%
+    group_by(date_rounded) %>%
+    summarise(total_sales = sum(total_price)) %>%
+    ungroup() %>%
+    mutate(label_text = str_glue("Sales: {format_to_euro(total_sales)} Date: {date_rounded %>% format('%d %B, %Y')}"))
+  } else if (input$time_unit == "Q") {
+    reactiveFilterredData() %>%
+    dplyr::select(order_date, total_price) %>%
+    mutate(date_rounded = zoo::as.yearqtr(order_date, format = "%Y-%m-%d")) %>%
+    group_by(date_rounded) %>%
+    summarise(total_sales = sum(total_price)) %>%
+    ungroup() %>%
+    mutate(label_text = str_glue("Sales: {format_to_euro(total_sales)} Date: {date_rounded}"))
+  } else if (input$time_unit == "Y") {
+    reactiveFilterredData() %>%
+    dplyr::select(order_date, total_price) %>%
+    mutate(date_rounded = floor_date(order_date, unit = "year")) %>%
+    group_by(date_rounded) %>%
+    summarise(total_sales = sum(total_price)) %>%
+    ungroup() %>%
+    mutate(label_text = str_glue("Sales: {format_to_euro(total_sales)} Date: {date_rounded %>% format('%Y')}"))
+  } else {
+    reactiveFilterredData() %>%
+    dplyr::select(order_date, total_price) %>%
+    mutate(date_rounded = floor_date(order_date, unit = "month")) %>%
+    group_by(date_rounded) %>%
+    summarise(total_sales = sum(total_price)) %>%
+    ungroup() %>%
+    mutate(label_text = str_glue("Sales: {format_to_euro(total_sales)} Date: {date_rounded %>% format('%B %Y')}"))
+  }
+})
+
+renderPlotly({
+    totalSalesTbl() %>% 
+      ggplot(aes(x = date_rounded, y = total_sales)) + 
+      # Geoms
+      geom_point() +
+      geom_smooth(method = "loess", span = 0.2) + 
+      scale_y_continuous(labels = euro_format()) +
+      expand_limits(y = 0) +
+      labs(
+          title = "Total Sales",
+          y = "Revenue (Euro)",
+          x = ""
+      )
+  })
+```
+<!-- Charts end -->
+
+<!-- Page layout end -->
